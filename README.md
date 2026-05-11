@@ -1,8 +1,10 @@
 # MISP Connector for Technitium DNS Server
 
-A plugin that pulls malicious domain names from MISP feeds and enforces blocking in Technitium DNS.
+A plugin that pulls malicious domain names from MISP feeds and enforces blocking in [Technitium DNS](https://github.com/TechnitiumSoftware/DnsServer).
 
 It maintains in-memory blocklists with disk-backed caching and periodically refreshes from the source.
+
+> NOTE: This App is not in main repository as of Technitium DNS Server [v15](https://github.com/TechnitiumSoftware/DnsServer/blob/master/CHANGELOG.md#version-150)
 
 ## What is MISP 
 

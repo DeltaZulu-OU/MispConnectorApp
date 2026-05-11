@@ -314,7 +314,7 @@ namespace MispConnector
         {
             HttpClientNetworkHandler handler = new HttpClientNetworkHandler();
             handler.Proxy = _dnsServer.Proxy;
-            handler.NetworkType = _dnsServer.PreferIPv6 ? HttpClientNetworkType.PreferIPv6 : HttpClientNetworkType.Default;
+            handler.NetworkType = _dnsServer.IPv6Mode == IPv6Mode.Preferred ? HttpClientNetworkType.PreferIPv6 : HttpClientNetworkType.Default;
             handler.DnsClient = _dnsServer;
 
             if (disableTlsValidation)

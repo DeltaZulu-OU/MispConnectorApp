@@ -17,7 +17,7 @@ See [this article](https://zaferbalkan.com/technitium-misp/) for a sample use ca
 ## Features
 
 - Retrieves `domain` attributes marked `to_ids` from published MISP events through `/attributes/restSearch`.
-- Reports the matched domain and MISP event ID by default.
+- Reports the MISP event ID by default.
 - Can optionally include source organisation, threat level, event description, and event tags.
 - Emits full event context only for events with MISP distribution `3` (`All communities`) and unrestricted TLP markings.
 - Handles paginated fetches with retry for transient network failures.
@@ -56,7 +56,7 @@ The attribute's `event_id` is enough for the default event-ID report, so parent 
 
 MISP can lower the requested `limit` according to the API user's role-level REST search limit. The connector therefore keeps requesting numbered pages until MISP returns an empty page instead of assuming that a short page is the final page.
 
-The connector deliberately does not retain every field returned by MISP. The matched domain and MISP event ID remain available for deeper investigation while long-lived per-IOC metadata is kept small.
+The connector deliberately does not retain every field returned by MISP. The blocklist domain and MISP event ID remain available for deeper investigation while long-lived per-IOC metadata is kept small.
 
 The original MISP feed name or feed URL is not resolved. MISP does not provide a universal feed identifier on every attribute, so feed provenance would require additional source-specific mapping.
 
@@ -94,16 +94,16 @@ Supply a JSON configuration like the following:
 
 ## Blocking responses
 
-With the default `reportContext: "event-id"`, a TXT report looks like:
+With the default `reportContext: "event-id"`, a blocking report looks like:
 
 ```text
-source=misp;event=3812;domain=evil.example
+source=misp;event=3812
 ```
 
 With `reportContext: "full"`, an eligible event can additionally produce:
 
 ```text
-source=misp;event=3812;domain=evil.example;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
+source=misp;event=3812;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
 ```
 
 Full event metadata is emitted only when `Event.distribution` is `3` (`All communities`) and the event has no restricted TLP marking. TLP tags other than `TLP:CLEAR` or the legacy `TLP:WHITE` suppress full context; this includes `TLP:GREEN`, `TLP:AMBER`, `TLP:AMBER+STRICT`, and `TLP:RED`. The MISP event ID can still be reported in the default `event-id` mode.
@@ -114,7 +114,6 @@ Possible full-context fields are:
 | --- | --- |
 | `source` | Always `misp`. |
 | `event` | MISP event ID. |
-| `domain` | The MISP domain attribute that matched the query or one of its parent domains. |
 | `org` | Source organisation (`Event.Orgc.name`). |
 | `threat` | MISP threat level. |
 | `info` | Parent event description (`Event.info`). |
@@ -124,7 +123,7 @@ Report values replace field delimiters and control characters before output. Tex
 
 For ordinary queries, the app returns `NXDOMAIN` with an SOA record in the authority section. If `allowTxtBlockingReport` is enabled and the blocked query type is `TXT`, it returns a report of at most 512 UTF-8 bytes as the TXT answer.
 
-If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The EDE text omits the domain because the DNS question already identifies it; with the default mode it is typically `source=misp;event=3812`. The shorter EDE form limits UDP response inflation; the TXT response is the appropriate place for longer diagnostics.
+If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The shorter EDE form limits UDP response inflation; the TXT response allows a larger diagnostic payload.
 
 ## Duplicate indicators
 

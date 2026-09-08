@@ -51,7 +51,6 @@ namespace MispConnector
         HttpClient _httpClient;
 
         Uri _mispApiUrl;
-        Uri _mispServerUrl;
 
         DnsSOARecordData _soaRecord;
         TimeSpan _updateInterval;
@@ -138,10 +137,9 @@ namespace MispConnector
                 _config = newConfig;
                 _domainCacheFilePath = domainCacheFilePath;
                 _updateInterval = updateInterval;
-                _mispServerUrl = newMispServerUrl;
                 _mispApiUrl = newMispApiUrl;
                 _soaRecord = new DnsSOARecordData(_dnsServer.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 14400, 3600, 604800, 60);
-                _httpClient = CreateHttpClient(_mispServerUrl, _config.DisableTlsValidation);
+                _httpClient = CreateHttpClient(newMispServerUrl, _config.DisableTlsValidation);
 
                 await LoadBlocklistFromCacheAsync();
                 _appShutdownCts = new CancellationTokenSource();
@@ -180,7 +178,7 @@ namespace MispConnector
 
             DnsQuestionRecord question = request.Question[0];
             IocSnapshot snapshot = _iocSnapshot;
-            if (!IsDomainBlocked(snapshot, question.Name, out string blockedDomain, out uint eventId))
+            if (!IsDomainBlocked(snapshot, question.Name, out uint eventId))
             {
                 return Task.FromResult<DnsDatagram>(null);
             }
@@ -191,12 +189,13 @@ namespace MispConnector
                 snapshot.EventContexts.TryGetValue(eventId, out eventContext);
 
             uint reportedEventId = string.Equals(_config.ReportContext, "none", StringComparison.Ordinal) ? 0 : eventId;
+            string blockingReport = BuildBlockingReport(reportedEventId, eventContext);
 
-            // Keep EDE text short to avoid inflating UDP responses. The DNS question already carries the blocked domain.
+            // The DNS question already identifies the blocked domain, so report text carries only MISP context.
             EDnsOption[] options = null;
             if (_config.AddExtendedDnsError && request.EDNS is not null)
             {
-                string edeReport = TruncateUtf8(BuildBlockingReport(null, reportedEventId, eventContext), 128);
+                string edeReport = TruncateUtf8(blockingReport, 128);
                 options = new EDnsOption[] { new EDnsOption(EDnsOptionCode.EXTENDED_DNS_ERROR, new EDnsExtendedDnsErrorOptionData(EDnsExtendedDnsErrorCode.Blocked, edeReport)) };
             }
 
@@ -206,7 +205,7 @@ namespace MispConnector
             DnsResponseCode rCode;
             if (_config.AllowTxtBlockingReport && question.Type == DnsResourceRecordType.TXT)
             {
-                string txtReport = TruncateUtf8(BuildBlockingReport(blockedDomain, reportedEventId, eventContext), 512);
+                string txtReport = TruncateUtf8(blockingReport, 512);
                 answer = new DnsResourceRecord[] { new DnsResourceRecord(question.Name, DnsResourceRecordType.TXT, question.Class, _config.BlockingAnswerTtl, new DnsTXTRecordData(txtReport)) };
                 rCode = DnsResponseCode.NoError;
             }
@@ -258,7 +257,7 @@ namespace MispConnector
                     {
                         await UpdateIocsAsync(cancellationToken);
                     }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    catch (Exception) when (cancellationToken.IsCancellationRequested)
                     {
                         _dnsServer.WriteLog("Update loop is shutting down gracefully.");
                         break;
@@ -303,46 +302,6 @@ namespace MispConnector
 
                 default:
                     throw new FormatException($"Invalid unit '{unit}' in update interval. Allowed units are 'm', 'h', 'd'.");
-            }
-        }
-
-        private async Task<bool> CheckTcpPortAsync(Uri serverUri, CancellationToken cancellationToken)
-        {
-            string host = serverUri.DnsSafeHost;
-            int port = serverUri.Port;
-            TimeSpan timeout = TimeSpan.FromSeconds(5);
-
-            _dnsServer.WriteLog($"Performing pre-flight TCP check for {host}:{port} with a {timeout.TotalSeconds}-second timeout...");
-
-            try
-            {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                cts.CancelAfter(timeout);
-
-                using var client = new TcpClient();
-                await client.ConnectAsync(host, port, cts.Token);
-
-                _dnsServer.WriteLog($"Pre-flight TCP check successful for {host}:{port}.");
-                return true;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (OperationCanceledException)
-            {
-                _dnsServer.WriteLog($"ERROR: Pre-flight TCP check failed: Connection to {host}:{port} timed out after {timeout.TotalSeconds} seconds. Check firewall rules or network route.");
-                return false;
-            }
-            catch (SocketException ex)
-            {
-                _dnsServer.WriteLog($"ERROR: Pre-flight TCP check failed: A network error occurred for {host}:{port}. Error: {ex.Message}");
-                return false;
-            }
-            catch (Exception ex)
-            {
-                _dnsServer.WriteLog($"ERROR: An unexpected error occurred during the pre-flight TCP check for {host}:{port}. Error: {ex.Message}");
-                return false;
             }
         }
 
@@ -509,7 +468,7 @@ namespace MispConnector
             return false;
         }
 
-        private static bool IsDomainBlocked(IocSnapshot snapshot, string domain, out string foundDomain, out uint eventId)
+        private static bool IsDomainBlocked(IocSnapshot snapshot, string domain, out uint eventId)
         {
             Dictionary<string, uint>.AlternateLookup<ReadOnlySpan<char>> lookup =
                 snapshot.Domains.GetAlternateLookup<ReadOnlySpan<char>>();
@@ -518,7 +477,7 @@ namespace MispConnector
 
             while (true)
             {
-                if (lookup.TryGetValue(currentSpan, out foundDomain, out eventId))
+                if (lookup.TryGetValue(currentSpan, out eventId))
                     return true;
 
                 int dotIndex = currentSpan.IndexOf('.');
@@ -528,12 +487,11 @@ namespace MispConnector
                 currentSpan = currentSpan.Slice(dotIndex + 1);
             }
 
-            foundDomain = null;
             eventId = 0;
             return false;
         }
 
-        private static string BuildBlockingReport(string domain, uint eventId, string eventContext)
+        private static string BuildBlockingReport(uint eventId, string eventContext)
         {
             StringBuilder report = new StringBuilder(256);
             report.Append("source=misp");
@@ -542,12 +500,6 @@ namespace MispConnector
             {
                 report.Append(";event=");
                 report.Append(eventId.ToString(CultureInfo.InvariantCulture));
-            }
-
-            if (!string.IsNullOrEmpty(domain))
-            {
-                report.Append(";domain=");
-                report.Append(domain);
             }
 
             if (!string.IsNullOrEmpty(eventContext))
@@ -709,9 +661,6 @@ namespace MispConnector
 
         private async Task UpdateIocsAsync(CancellationToken cancellationToken)
         {
-            if (!await CheckTcpPortAsync(_mispServerUrl, cancellationToken))
-                return;
-
             _dnsServer.WriteLog("MISP Connector: Starting IOC update...");
 
             IocSnapshot candidate = await FetchIocFromMispAsync(cancellationToken);

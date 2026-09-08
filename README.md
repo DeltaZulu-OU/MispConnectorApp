@@ -19,7 +19,7 @@ See [this article](https://zaferbalkan.com/technitium-misp/) for a sample use ca
 - Retrieves `domain` attributes marked `to_ids` from published MISP events through `/attributes/restSearch`.
 - Reports the matched domain and MISP event ID by default.
 - Can optionally include source organisation, threat level, event description, and event tags.
-- Suppresses full event context for restricted TLP-marked events.
+- Emits full event context only for events with MISP distribution `3` (`All communities`) and unrestricted TLP markings.
 - Handles paginated fetches with retry for transient network failures.
 - Matches both exact domains and parent domains without allocating new strings during lookup.
 - Blocks matching DNS requests with `NXDOMAIN`, or returns a TXT blocking report when enabled.
@@ -54,6 +54,8 @@ The connector explicitly filters for published events. This is required for the 
 
 The attribute's `event_id` is enough for the default event-ID report, so parent event objects are not requested or retained. When `reportContext` is set to `full`, `includeContext` is enabled so the connector can use parent-event information without a second MISP request.
 
+MISP can lower the requested `limit` according to the API user's role-level REST search limit. The connector therefore keeps requesting numbered pages until MISP returns an empty page instead of assuming that a short page is the final page.
+
 The connector deliberately does not retain every field returned by MISP. The matched domain and MISP event ID remain available for deeper investigation while long-lived per-IOC metadata is kept small.
 
 The original MISP feed name or feed URL is not resolved. MISP does not provide a universal feed identifier on every attribute, so feed provenance would require additional source-specific mapping.
@@ -86,7 +88,7 @@ Supply a JSON configuration like the following:
 * `maxIocAge` is passed to MISP as the `last` search parameter. In current MISP versions, `last` is an alias for the event publication timestamp filter; it does not filter the attribute's `last_seen` field directly. Supported suffixes are `m`, `h`, and `d`.
 * `blockingAnswerTtl` sets the TTL, in seconds, for blocking TXT answers and SOA records. The allowed range is `30` to `86400`; the default is `30`.
 * `allowTxtBlockingReport` returns a TXT blocking report for blocked TXT queries instead of `NXDOMAIN`.
-* `paginationLimit` controls how many attributes are requested from MISP per page. The default is `1000` and the accepted range is `1` to `10000`. Smaller pages reduce transient memory use during refresh at the cost of more API requests.
+* `paginationLimit` controls how many attributes are requested from MISP per page. The default is `1000` and the accepted range is `1` to `10000`. MISP may lower this value for the API user's role. Smaller pages reduce transient memory use during refresh at the cost of more API requests.
 * `reportContext` controls how much MISP information is exposed in blocking reports: `none` reports only the source and matched domain, `event-id` also reports the MISP event ID and is the default, and `full` opts in to additional event metadata.
 * `addExtendedDnsError` adds a short blocking report to the EDNS payload when the query includes EDNS.
 
@@ -95,24 +97,24 @@ Supply a JSON configuration like the following:
 With the default `reportContext: "event-id"`, a report looks like:
 
 ```text
-source=misp-connector;domain=evil.example;event=3812
+source=misp-connector;event=3812;domain=evil.example
 ```
 
-With `reportContext: "full"`, an unrestricted event can additionally produce:
+With `reportContext: "full"`, an eligible event can additionally produce:
 
 ```text
-source=misp-connector;domain=evil.example;event=3812;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
+source=misp-connector;event=3812;domain=evil.example;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
 ```
 
-Full event metadata is not emitted when the event has a TLP tag other than `TLP:CLEAR` or the legacy `TLP:WHITE`. This includes `TLP:GREEN`, `TLP:AMBER`, `TLP:AMBER+STRICT`, and `TLP:RED`.
+Full event metadata is emitted only when `Event.distribution` is `3` (`All communities`) and the event has no restricted TLP marking. TLP tags other than `TLP:CLEAR` or the legacy `TLP:WHITE` suppress full context; this includes `TLP:GREEN`, `TLP:AMBER`, `TLP:AMBER+STRICT`, and `TLP:RED`. The MISP event ID can still be reported in the default `event-id` mode.
 
 Possible full-context fields are:
 
 | Field | Meaning |
 | --- | --- |
 | `source` | Always `misp-connector`. |
-| `domain` | The MISP domain attribute that matched the query or one of its parent domains. |
 | `event` | MISP event ID. |
+| `domain` | The MISP domain attribute that matched the query or one of its parent domains. |
 | `org` | Source organisation (`Event.Orgc.name`). |
 | `threat` | MISP threat level. |
 | `info` | Parent event description (`Event.info`). |
@@ -122,7 +124,7 @@ Report values replace field delimiters and control characters before output. Tex
 
 For ordinary queries, the app returns `NXDOMAIN` with an SOA record in the authority section. If `allowTxtBlockingReport` is enabled and the blocked query type is `TXT`, it returns a report of at most 512 UTF-8 bytes as the TXT answer.
 
-If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The shorter EDE form limits UDP response inflation; the TXT response is the appropriate place for longer diagnostics.
+If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The event ID is placed before the domain so it remains available when a long domain causes the tail of the EDE text to be truncated. The shorter EDE form limits UDP response inflation; the TXT response is the appropriate place for longer diagnostics.
 
 ## Duplicate indicators
 

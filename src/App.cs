@@ -97,24 +97,50 @@ namespace MispConnector
             _dnsServer = dnsServer;
             try
             {
-                _soaRecord = new DnsSOARecordData(_dnsServer.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 14400, 3600, 604800, 60);
-
                 JsonSerializerOptions options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                _config = JsonSerializer.Deserialize<Config>(config, options);
+                Config newConfig = JsonSerializer.Deserialize<Config>(config, options);
 
-                Validator.ValidateObject(_config, new ValidationContext(_config), validateAllProperties: true);
+                Validator.ValidateObject(newConfig, new ValidationContext(newConfig), validateAllProperties: true);
 
                 string configDir = _dnsServer.ApplicationFolder;
                 Directory.CreateDirectory(configDir);
-                _domainCacheFilePath = Path.Combine(configDir, "misp_domain_cache.txt");
+                string domainCacheFilePath = Path.Combine(configDir, "misp_domain_cache.txt");
 
-                _updateInterval = ParseUpdateInterval(_config.UpdateInterval);
+                TimeSpan updateInterval = ParseUpdateInterval(newConfig.UpdateInterval);
 
-                string mispServerUrl = _config.MispServerUrl.EndsWith("/", StringComparison.Ordinal)
-                    ? _config.MispServerUrl
-                    : _config.MispServerUrl + "/";
-                _mispServerUrl = new Uri(mispServerUrl);
-                _mispApiUrl = new Uri(_mispServerUrl, "attributes/restSearch");
+                string mispServerUrl = newConfig.MispServerUrl.EndsWith("/", StringComparison.Ordinal)
+                    ? newConfig.MispServerUrl
+                    : newConfig.MispServerUrl + "/";
+                Uri newMispServerUrl = new Uri(mispServerUrl);
+                Uri newMispApiUrl = new Uri(newMispServerUrl, "attributes/restSearch");
+
+                if (_appShutdownCts != null)
+                {
+                    _appShutdownCts.Cancel();
+                    if (_updateLoopTask != null)
+                    {
+                        try
+                        {
+                            await _updateLoopTask.WaitAsync(TimeSpan.FromSeconds(2));
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    _appShutdownCts.Dispose();
+                    _appShutdownCts = null;
+                    _updateLoopTask = null;
+                }
+
+                _httpClient?.Dispose();
+
+                _config = newConfig;
+                _domainCacheFilePath = domainCacheFilePath;
+                _updateInterval = updateInterval;
+                _mispServerUrl = newMispServerUrl;
+                _mispApiUrl = newMispApiUrl;
+                _soaRecord = new DnsSOARecordData(_dnsServer.ServerDomain, _dnsServer.ResponsiblePerson.Address, 1, 14400, 3600, 604800, 60);
                 _httpClient = CreateHttpClient(_mispServerUrl, _config.DisableTlsValidation);
 
                 await LoadBlocklistFromCacheAsync();
@@ -350,12 +376,11 @@ namespace MispConnector
             int initialDomainCapacity = current.Domains.Count > 0 ? current.Domains.Count : limit;
             Dictionary<string, uint> iocs = new Dictionary<string, uint>(initialDomainCapacity, StringComparer.OrdinalIgnoreCase);
             Dictionary<uint, string> eventContexts = new Dictionary<uint, string>(current.EventContexts.Count);
-            bool hasMorePages = true;
 
             _dnsServer.WriteLog($"Starting paginated fetch from MISP API with a page size of {limit}...");
             const int maxRetries = 3;
 
-            while (hasMorePages)
+            while (true)
             {
                 int attempt = 0;
                 MispResponse mispResponse = null;
@@ -416,10 +441,7 @@ namespace MispConnector
                     throw new InvalidDataException("Invalid or unexpected MISP response schema.");
 
                 if (attributes.Count == 0)
-                {
-                    hasMorePages = false;
-                    continue;
-                }
+                    break;
 
                 foreach (MispAttribute attribute in attributes)
                 {
@@ -449,10 +471,7 @@ namespace MispConnector
                     }
                 }
 
-                if (attributes.Count < limit)
-                    hasMorePages = false;
-                else
-                    page++;
+                page++;
             }
 
             iocs.TrimExcess();
@@ -518,14 +537,16 @@ namespace MispConnector
         private static string BuildBlockingReport(string domain, uint eventId, string eventContext)
         {
             StringBuilder report = new StringBuilder(256);
-            report.Append("source=misp-connector;domain=");
-            report.Append(domain);
+            report.Append("source=misp-connector");
 
             if (eventId != 0)
             {
                 report.Append(";event=");
                 report.Append(eventId.ToString(CultureInfo.InvariantCulture));
             }
+
+            report.Append(";domain=");
+            report.Append(domain);
 
             if (!string.IsNullOrEmpty(eventContext))
                 report.Append(eventContext);
@@ -535,7 +556,9 @@ namespace MispConnector
 
         private static string BuildEventContext(MispEvent mispEvent)
         {
-            if (mispEvent is null || HasRestrictedTlp(mispEvent.Tags))
+            if (mispEvent is null ||
+                !string.Equals(mispEvent.Distribution, "3", StringComparison.Ordinal) ||
+                HasRestrictedTlp(mispEvent.Tags))
                 return null;
 
             StringBuilder context = new StringBuilder(192);
@@ -830,6 +853,9 @@ namespace MispConnector
 
             [JsonPropertyName("threat_level_id")]
             public string ThreatLevelId { get; set; }
+
+            [JsonPropertyName("distribution")]
+            public string Distribution { get; set; }
 
             [JsonPropertyName("Orgc")]
             public MispOrganisation Orgc { get; set; }

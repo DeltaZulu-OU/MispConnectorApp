@@ -110,8 +110,11 @@ namespace MispConnector
 
                 _updateInterval = ParseUpdateInterval(_config.UpdateInterval);
 
-                _mispServerUrl = new Uri(_config.MispServerUrl);
-                _mispApiUrl = new Uri(_mispServerUrl, "/attributes/restSearch");
+                string mispServerUrl = _config.MispServerUrl.EndsWith("/", StringComparison.Ordinal)
+                    ? _config.MispServerUrl
+                    : _config.MispServerUrl + "/";
+                _mispServerUrl = new Uri(mispServerUrl);
+                _mispApiUrl = new Uri(_mispServerUrl, "attributes/restSearch");
                 _httpClient = CreateHttpClient(_mispServerUrl, _config.DisableTlsValidation);
 
                 await LoadBlocklistFromCacheAsync();
@@ -368,6 +371,7 @@ namespace MispConnector
                             Type = "domain",
                             To_ids = true,
                             Deleted = false,
+                            Published = true,
                             Last = _config.MaxIocAge,
                             IncludeContext = fullContext,
                             Limit = limit,
@@ -853,6 +857,9 @@ namespace MispConnector
 
             [JsonPropertyName("deleted")]
             public bool Deleted { get; set; }
+
+            [JsonPropertyName("published")]
+            public bool Published { get; set; }
 
             [JsonPropertyName("last")]
             public string Last { get; set; }

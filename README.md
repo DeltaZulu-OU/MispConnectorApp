@@ -16,7 +16,7 @@ See [this article](https://zaferbalkan.com/technitium-misp/) for a sample use ca
 
 ## Features
 
-- Retrieves `domain` attributes marked `to_ids` from MISP through `/attributes/restSearch`.
+- Retrieves `domain` attributes marked `to_ids` from published MISP events through `/attributes/restSearch`.
 - Reports the matched domain and MISP event ID by default.
 - Can optionally include source organisation, threat level, event description, and event tags.
 - Suppresses full event context for restricted TLP-marked events.
@@ -42,12 +42,15 @@ With the default `reportContext` setting, each request is conceptually:
   "type": "domain",
   "to_ids": true,
   "deleted": false,
+  "published": true,
   "last": "15d",
   "includeContext": false,
   "limit": 1000,
   "page": 1
 }
 ```
+
+The connector explicitly filters for published events. This is required for the JSON export because MISP does not implicitly apply the `published` filter to non-restrictive JSON `restSearch` responses.
 
 The attribute's `event_id` is enough for the default event-ID report, so parent event objects are not requested or retained. When `reportContext` is set to `full`, `includeContext` is enabled so the connector can use parent-event information without a second MISP request.
 
@@ -76,7 +79,7 @@ Supply a JSON configuration like the following:
 ```
 
 * `enableBlocking` lets you disable enforcement without uninstalling the app.
-* `mispServerUrl` is the base URL of the MISP instance.
+* `mispServerUrl` is the base URL of the MISP instance. Path-prefixed deployments such as `https://example.com/misp/` are supported.
 * `mispApiKey` is the API key used to query MISP.
 * `disableTlsValidation` can be useful for test instances and homelabs, but it is not recommended in production.
 * `updateInterval` controls how often the app refreshes indicators from MISP. Supported suffixes are `m`, `h`, and `d`.

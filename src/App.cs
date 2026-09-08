@@ -1,4 +1,4 @@
-﻿/*
+/*
 Technitium DNS Server
 Copyright (C) 2025  Shreyas Zare (shreyas@technitium.com)
 Copyright (C) 2025  Zafer Balkan (zafer@zaferbalkan.com)
@@ -19,7 +19,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 using DnsServerCore.ApplicationCommon;
 using System;
-using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
@@ -48,7 +47,7 @@ namespace MispConnector
         string _domainCacheFilePath;
         Config _config;
         IDnsServer _dnsServer;
-        FrozenSet<string> _domainBlocklist = FrozenSet<string>.Empty;
+        IocSnapshot _iocSnapshot = IocSnapshot.Empty;
         HttpClient _httpClient;
 
         Uri _mispApiUrl;
@@ -151,19 +150,26 @@ namespace MispConnector
             }
 
             DnsQuestionRecord question = request.Question[0];
-            bool domainBlocked = IsDomainBlocked(question.Name, out string blockedDomain);
-            if (!domainBlocked)
+            IocSnapshot snapshot = _iocSnapshot;
+            if (!IsDomainBlocked(snapshot, question.Name, out string blockedDomain, out uint eventId))
             {
                 return Task.FromResult<DnsDatagram>(null);
             }
 
-            string blockingReport = $"source=misp-connector;domain={blockedDomain}";
+            bool fullContext = string.Equals(_config.ReportContext, "full", StringComparison.Ordinal);
+            string eventContext = null;
+            if (fullContext && eventId != 0)
+                snapshot.EventContexts.TryGetValue(eventId, out eventContext);
 
-            // Add blocking report as EDE to EDNS options for both TXT and other queries if the query datagram has EDNS field
+            uint reportedEventId = string.Equals(_config.ReportContext, "none", StringComparison.Ordinal) ? 0 : eventId;
+            string blockingReport = BuildBlockingReport(blockedDomain, reportedEventId, eventContext);
+
+            // Keep EDE text short to avoid inflating UDP responses.
             EDnsOption[] options = null;
             if (_config.AddExtendedDnsError && request.EDNS is not null)
             {
-                options = new EDnsOption[] { new EDnsOption(EDnsOptionCode.EXTENDED_DNS_ERROR, new EDnsExtendedDnsErrorOptionData(EDnsExtendedDnsErrorCode.Blocked, blockingReport)) };
+                string edeReport = TruncateUtf8(blockingReport, 128);
+                options = new EDnsOption[] { new EDnsOption(EDnsOptionCode.EXTENDED_DNS_ERROR, new EDnsExtendedDnsErrorOptionData(EDnsExtendedDnsErrorCode.Blocked, edeReport)) };
             }
 
             DnsResourceRecord[] answer = null;
@@ -172,7 +178,8 @@ namespace MispConnector
             DnsResponseCode rCode;
             if (_config.AllowTxtBlockingReport && question.Type == DnsResourceRecordType.TXT)
             {
-                answer = new DnsResourceRecord[] { new DnsResourceRecord(question.Name, DnsResourceRecordType.TXT, question.Class, _config.BlockingAnswerTtl, new DnsTXTRecordData(blockingReport)) };
+                string txtReport = TruncateUtf8(blockingReport, 512);
+                answer = new DnsResourceRecord[] { new DnsResourceRecord(question.Name, DnsResourceRecordType.TXT, question.Class, _config.BlockingAnswerTtl, new DnsTXTRecordData(txtReport)) };
                 rCode = DnsResponseCode.NoError;
             }
             else
@@ -211,6 +218,7 @@ namespace MispConnector
         #endregion public
 
         #region private
+
         private async Task StartUpdateLoopAsync(CancellationToken cancellationToken)
         {
             await Task.Delay(TimeSpan.FromSeconds(Random.Shared.Next(5, 30)), cancellationToken);
@@ -227,7 +235,6 @@ namespace MispConnector
                         _dnsServer.WriteLog("Update loop is shutting down gracefully.");
                         break;
                     }
-
                     catch (Exception ex)
                     {
                         _dnsServer.WriteLog($"FATAL: The MispConnector update task failed unexpectedly. Error: {ex.Message}");
@@ -239,6 +246,7 @@ namespace MispConnector
                 }
             }
         }
+
         private static TimeSpan ParseUpdateInterval(string interval)
         {
             if (string.IsNullOrWhiteSpace(interval) || interval.Length < 2)
@@ -330,11 +338,15 @@ namespace MispConnector
             return new HttpClient(handler);
         }
 
-        private async Task<HashSet<string>> FetchIocFromMispAsync(CancellationToken cancellationToken)
+        private async Task<IocSnapshot> FetchIocFromMispAsync(CancellationToken cancellationToken)
         {
-            HashSet<string> iocSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int page = 1;
             int limit = _config.PaginationLimit;
+            bool fullContext = string.Equals(_config.ReportContext, "full", StringComparison.Ordinal);
+            IocSnapshot current = _iocSnapshot;
+            int initialDomainCapacity = current.Domains.Count > 0 ? current.Domains.Count : limit;
+            Dictionary<string, uint> iocs = new Dictionary<string, uint>(initialDomainCapacity, StringComparer.OrdinalIgnoreCase);
+            Dictionary<uint, string> eventContexts = new Dictionary<uint, string>(current.EventContexts.Count);
             bool hasMorePages = true;
 
             _dnsServer.WriteLog($"Starting paginated fetch from MISP API with a page size of {limit}...");
@@ -352,10 +364,12 @@ namespace MispConnector
                     {
                         MispRequestBody requestBody = new MispRequestBody
                         {
+                            ReturnFormat = "json",
                             Type = "domain",
                             To_ids = true,
                             Deleted = false,
                             Last = _config.MaxIocAge,
+                            IncludeContext = fullContext,
                             Limit = limit,
                             Page = page
                         };
@@ -365,13 +379,10 @@ namespace MispConnector
                         request.Headers.Add("Authorization", _config.MispApiKey);
                         request.Headers.Add("Accept", "application/json");
 
-                        _dnsServer.WriteLog($"Fetching page {page}, attempt {attempt}/{maxRetries}...");
                         using HttpResponseMessage response = await _httpClient.SendAsync(request, cancellationToken);
 
                         if (!response.IsSuccessStatusCode)
                         {
-                            // This is a definitive failure from the server (e.g., 403, 500).
-                            // We should not retry this. Abort immediately.
                             string errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
                             throw new HttpRequestException($"MISP API returned a non-success status code: {(int)response.StatusCode}. Body: {errorBody}", null, response.StatusCode);
                         }
@@ -395,12 +406,11 @@ namespace MispConnector
                         if (!await HandleRetry(ex, page, maxRetries, attempt, cancellationToken))
                             throw;
                     }
-
                 }
 
-                List<MispAttribute> attributes = (mispResponse?.Response?.Attribute) ?? 
+                List<MispAttribute> attributes = (mispResponse?.Response?.Attribute) ??
                     throw new InvalidDataException("Invalid or unexpected MISP response schema.");
-                
+
                 if (attributes.Count == 0)
                 {
                     hasMorePages = false;
@@ -410,26 +420,41 @@ namespace MispConnector
                 foreach (MispAttribute attribute in attributes)
                 {
                     string ioc = attribute.Value?.Trim();
+                    if (string.IsNullOrEmpty(ioc) || !DnsClient.IsDomainNameValid(ioc))
+                        continue;
 
-                    if (!string.IsNullOrEmpty(ioc) && DnsClient.IsDomainNameValid(ioc))
+                    uint eventId = ParseEventId(attribute.Event?.Id ?? attribute.EventId);
+
+                    if (fullContext && eventId != 0 && !eventContexts.ContainsKey(eventId))
                     {
-                        iocSet.Add(ioc);
+                        string context = BuildEventContext(attribute.Event);
+                        if (!string.IsNullOrEmpty(context))
+                            eventContexts.Add(eventId, context);
+                    }
+
+                    if (iocs.TryGetValue(ioc, out uint existingEventId))
+                    {
+                        if (eventId == 0 || (existingEventId != 0 && existingEventId <= eventId))
+                            continue;
+
+                        iocs[ioc] = eventId;
+                    }
+                    else
+                    {
+                        iocs.Add(ioc, eventId);
                     }
                 }
 
-                // Assumption: If we received fewer items than our limit, it must be the last page.
                 if (attributes.Count < limit)
-                {
                     hasMorePages = false;
-                }
                 else
-                {
                     page++;
-                }
             }
 
-            _dnsServer.WriteLog($"Finished paginated fetch. Freezing {iocSet.Count} IOCs for optimal read performance...");
-            return iocSet;
+            iocs.TrimExcess();
+            eventContexts.TrimExcess();
+            _dnsServer.WriteLog($"Finished paginated fetch. Retained {iocs.Count} unique domain IOCs and {eventContexts.Count} event context records.");
+            return new IocSnapshot(iocs, eventContexts);
         }
 
         private async Task<bool> HandleRetry(
@@ -453,28 +478,25 @@ namespace MispConnector
                     $"Waiting for {delay.TotalSeconds:F1} seconds before retrying...");
 
                 await Task.Delay(delay, cancellationToken);
-                return true; // retry
+                return true;
             }
 
             _dnsServer.WriteLog(
                 $"ERROR: Failed to fetch page {page} after {maxRetries} attempts.");
 
-            return false; // abort
+            return false;
         }
 
-
-        private bool IsDomainBlocked(string domain, out string foundZone)
+        private static bool IsDomainBlocked(IocSnapshot snapshot, string domain, out string foundDomain, out uint eventId)
         {
-            FrozenSet<string> currentBlocklist = _domainBlocklist;
-
-            // Span-based lookup
-            FrozenSet<string>.AlternateLookup<ReadOnlySpan<char>> lookup = currentBlocklist.GetAlternateLookup<ReadOnlySpan<char>>();
+            Dictionary<string, uint>.AlternateLookup<ReadOnlySpan<char>> lookup =
+                snapshot.Domains.GetAlternateLookup<ReadOnlySpan<char>>();
 
             ReadOnlySpan<char> currentSpan = domain.AsSpan();
 
             while (true)
             {
-                if (lookup.TryGetValue(currentSpan, out foundZone))
+                if (lookup.TryGetValue(currentSpan, out foundDomain, out eventId))
                     return true;
 
                 int dotIndex = currentSpan.IndexOf('.');
@@ -484,63 +506,220 @@ namespace MispConnector
                 currentSpan = currentSpan.Slice(dotIndex + 1);
             }
 
-            foundZone = null;
+            foundDomain = null;
+            eventId = 0;
             return false;
+        }
+
+        private static string BuildBlockingReport(string domain, uint eventId, string eventContext)
+        {
+            StringBuilder report = new StringBuilder(256);
+            report.Append("source=misp-connector;domain=");
+            report.Append(domain);
+
+            if (eventId != 0)
+            {
+                report.Append(";event=");
+                report.Append(eventId.ToString(CultureInfo.InvariantCulture));
+            }
+
+            if (!string.IsNullOrEmpty(eventContext))
+                report.Append(eventContext);
+
+            return report.ToString();
+        }
+
+        private static string BuildEventContext(MispEvent mispEvent)
+        {
+            if (mispEvent is null || HasRestrictedTlp(mispEvent.Tags))
+                return null;
+
+            StringBuilder context = new StringBuilder(192);
+            AppendReportField(context, "org", NormalizeReportValue(mispEvent.Orgc?.Name, 80));
+            AppendReportField(context, "threat", GetThreatLevelName(mispEvent.ThreatLevelId));
+            AppendReportField(context, "info", NormalizeReportValue(mispEvent.Info, 120));
+            AppendReportField(context, "tags", BuildEventTags(mispEvent.Tags));
+            return context.Length == 0 ? null : context.ToString();
+        }
+
+        private static bool HasRestrictedTlp(List<MispTag> tags)
+        {
+            if (tags is null)
+                return false;
+
+            foreach (MispTag tag in tags)
+            {
+                string name = tag?.Name?.Trim();
+                if (string.IsNullOrEmpty(name) || !name.StartsWith("tlp:", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!name.Equals("tlp:clear", StringComparison.OrdinalIgnoreCase) &&
+                    !name.Equals("tlp:white", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void AppendReportField(StringBuilder report, string name, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+
+            report.Append(';');
+            report.Append(name);
+            report.Append('=');
+            report.Append(value);
+        }
+
+        private static string NormalizeReportValue(string value, int maxBytes)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            string trimmed = value.Trim();
+            StringBuilder cleaned = new StringBuilder(trimmed.Length);
+            foreach (char c in trimmed)
+            {
+                if (c == ';')
+                    cleaned.Append(',');
+                else if (c == '=')
+                    cleaned.Append(':');
+                else if (char.IsControl(c))
+                    cleaned.Append(' ');
+                else
+                    cleaned.Append(c);
+            }
+
+            return TruncateUtf8(cleaned.ToString(), maxBytes);
+        }
+
+        private static string BuildEventTags(List<MispTag> tags)
+        {
+            if (tags is null || tags.Count == 0)
+                return null;
+
+            const int maxTagBytes = 160;
+            int usedBytes = 0;
+            StringBuilder result = new StringBuilder(96);
+            foreach (MispTag tag in tags)
+            {
+                string name = NormalizeReportValue(tag?.Name, 64);
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                int nameBytes = Encoding.UTF8.GetByteCount(name);
+                int separatorBytes = result.Length > 0 ? 1 : 0;
+                if (usedBytes + separatorBytes + nameBytes > maxTagBytes)
+                    break;
+
+                if (separatorBytes != 0)
+                    result.Append(',');
+
+                result.Append(name);
+                usedBytes += separatorBytes + nameBytes;
+            }
+
+            return result.Length == 0 ? null : result.ToString();
+        }
+
+        private static string TruncateUtf8(string value, int maxBytes)
+        {
+            if (string.IsNullOrEmpty(value) || Encoding.UTF8.GetByteCount(value) <= maxBytes)
+                return value;
+
+            const string ellipsis = "...";
+            int availableBytes = maxBytes - ellipsis.Length;
+            Span<byte> buffer = stackalloc byte[availableBytes];
+            Encoding.UTF8.GetEncoder().Convert(value.AsSpan(), buffer, true, out int charsUsed, out _, out _);
+            return value.Substring(0, charsUsed) + ellipsis;
+        }
+
+        private static uint ParseEventId(string eventId)
+        {
+            return uint.TryParse(eventId, NumberStyles.None, CultureInfo.InvariantCulture, out uint value) ? value : 0;
+        }
+
+        private static string GetThreatLevelName(string threatLevelId)
+        {
+            return threatLevelId switch
+            {
+                "1" => "high",
+                "2" => "medium",
+                "3" => "low",
+                "4" => "undefined",
+                _ => null
+            };
         }
 
         private async Task LoadBlocklistFromCacheAsync()
         {
-            if (File.Exists(_domainCacheFilePath))
+            if (!File.Exists(_domainCacheFilePath))
+                return;
+
+            try
             {
-                try
+                Dictionary<string, uint> domains = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+
+                await foreach (string line in File.ReadLinesAsync(_domainCacheFilePath))
                 {
-                    var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                    await foreach (var line in File.ReadLinesAsync(_domainCacheFilePath))
-                    {
-                        var d = line.Trim();
-
-                        if (d.Length > 0)
-                            set.Add(d);
-                    }
-
-                    FrozenSet<string> domains = set.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
-                    Interlocked.Exchange(ref _domainBlocklist, domains);
-                    _dnsServer.WriteLog($"MISP Connector: Loaded {domains.Count} domains from cache.");
+                    string domain = line.Trim();
+                    if (domain.Length > 0 && DnsClient.IsDomainNameValid(domain))
+                        domains[domain] = 0;
                 }
-                catch (IOException ex)
-                {
-                    _dnsServer.WriteLog($"ERROR: Failed to read cache file '{_domainCacheFilePath}'. Error: {ex.Message}");
-                }
+
+                domains.TrimExcess();
+                Interlocked.Exchange(ref _iocSnapshot, new IocSnapshot(domains, new Dictionary<uint, string>()));
+                _dnsServer.WriteLog($"MISP Connector: Loaded {domains.Count} domains from cache.");
+            }
+            catch (IOException ex)
+            {
+                _dnsServer.WriteLog($"ERROR: Failed to read cache file '{_domainCacheFilePath}'. Error: {ex.Message}");
             }
         }
 
         private async Task UpdateIocsAsync(CancellationToken cancellationToken)
         {
             if (!await CheckTcpPortAsync(_mispServerUrl, cancellationToken))
-            {
                 return;
-            }
 
             _dnsServer.WriteLog("MISP Connector: Starting IOC update...");
 
-            HashSet<string> tmpDomains = await FetchIocFromMispAsync(cancellationToken);
+            IocSnapshot candidate = await FetchIocFromMispAsync(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            FrozenSet<string> domains = tmpDomains.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
-            if (!domains.SetEquals(_domainBlocklist))
+            if (IocDataEquals(_iocSnapshot, candidate))
             {
-                await WriteIocsToCacheAsync(domains, cancellationToken);
-                Interlocked.Exchange(ref _domainBlocklist, domains);
-                _dnsServer.WriteLog($"MISP Connector: Successfully updated currentBlocklist with {domains.Count} domains.");
+                _dnsServer.WriteLog("MISP data has not changed. No update to current blocklist or cache is necessary.");
+                return;
             }
-            else
-            {
-                _dnsServer.WriteLog("MISP data has not changed. No update to currentBlocklist or cache is necessary.");
-            }
+
+            await WriteIocsToCacheAsync(candidate.Domains.Keys, cancellationToken);
+            Interlocked.Exchange(ref _iocSnapshot, candidate);
+            _dnsServer.WriteLog($"MISP Connector: Successfully updated blocklist with {candidate.Domains.Count} domains from {candidate.EventContexts.Count} MISP event context records.");
         }
 
-        private async Task WriteIocsToCacheAsync(FrozenSet<string> iocs, CancellationToken cancellationToken)
+        private static bool IocDataEquals(IocSnapshot current, IocSnapshot candidate)
+        {
+            if (current.Domains.Count != candidate.Domains.Count || current.EventContexts.Count != candidate.EventContexts.Count)
+                return false;
+
+            foreach (KeyValuePair<string, uint> item in candidate.Domains)
+            {
+                if (!current.Domains.TryGetValue(item.Key, out uint existing) || existing != item.Value)
+                    return false;
+            }
+
+            foreach (KeyValuePair<uint, string> item in candidate.EventContexts)
+            {
+                if (!current.EventContexts.TryGetValue(item.Key, out string existing) || !string.Equals(existing, item.Value, StringComparison.Ordinal))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private async Task WriteIocsToCacheAsync(IEnumerable<string> iocs, CancellationToken cancellationToken)
         {
             string tempPath = _domainCacheFilePath + ".tmp";
             await File.WriteAllLinesAsync(tempPath, iocs, cancellationToken);
@@ -595,7 +774,13 @@ namespace MispConnector
             public string MispServerUrl { get; set; }
 
             [JsonPropertyName("paginationLimit")]
-            public int PaginationLimit { get; set; } = 5000;
+            [Range(1, 10000, ErrorMessage = "paginationLimit must be between 1 and 10000.")]
+            public int PaginationLimit { get; set; } = 1000;
+
+            [JsonPropertyName("reportContext")]
+            [Required(ErrorMessage = "reportContext is a required configuration property.")]
+            [RegularExpression(@"^(none|event-id|full)$", ErrorMessage = "reportContext must be 'none', 'event-id', or 'full'.", MatchTimeoutInMilliseconds = 3000)]
+            public string ReportContext { get; set; } = "event-id";
 
             [JsonPropertyName("updateInterval")]
             [Required(ErrorMessage = "updateInterval is a required configuration property.")]
@@ -603,19 +788,77 @@ namespace MispConnector
             public string UpdateInterval { get; set; }
         }
 
+        private sealed class IocSnapshot
+        {
+            public static readonly IocSnapshot Empty = new IocSnapshot(
+                new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase),
+                new Dictionary<uint, string>());
+
+            public IocSnapshot(Dictionary<string, uint> domains, Dictionary<uint, string> eventContexts)
+            {
+                Domains = domains;
+                EventContexts = eventContexts;
+            }
+
+            public Dictionary<string, uint> Domains { get; }
+            public Dictionary<uint, string> EventContexts { get; }
+        }
+
         private class MispAttribute
         {
             [JsonPropertyName("value")]
             public string Value { get; set; }
+
+            [JsonPropertyName("event_id")]
+            public string EventId { get; set; }
+
+            [JsonPropertyName("Event")]
+            public MispEvent Event { get; set; }
+        }
+
+        private class MispEvent
+        {
+            [JsonPropertyName("id")]
+            public string Id { get; set; }
+
+            [JsonPropertyName("info")]
+            public string Info { get; set; }
+
+            [JsonPropertyName("threat_level_id")]
+            public string ThreatLevelId { get; set; }
+
+            [JsonPropertyName("Orgc")]
+            public MispOrganisation Orgc { get; set; }
+
+            [JsonPropertyName("Tag")]
+            public List<MispTag> Tags { get; set; }
+        }
+
+        private class MispOrganisation
+        {
+            [JsonPropertyName("name")]
+            public string Name { get; set; }
+        }
+
+        private class MispTag
+        {
+            [JsonPropertyName("name")]
+            public string Name { get; set; }
         }
 
         private class MispRequestBody
         {
+            [JsonPropertyName("returnFormat")]
+            public string ReturnFormat { get; set; }
+
             [JsonPropertyName("deleted")]
             public bool Deleted { get; set; }
 
             [JsonPropertyName("last")]
             public string Last { get; set; }
+
+            [JsonPropertyName("includeContext")]
+            public bool IncludeContext { get; set; }
 
             [JsonPropertyName("limit")]
             public int Limit { get; set; }

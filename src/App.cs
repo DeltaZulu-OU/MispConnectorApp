@@ -191,13 +191,12 @@ namespace MispConnector
                 snapshot.EventContexts.TryGetValue(eventId, out eventContext);
 
             uint reportedEventId = string.Equals(_config.ReportContext, "none", StringComparison.Ordinal) ? 0 : eventId;
-            string blockingReport = BuildBlockingReport(blockedDomain, reportedEventId, eventContext);
 
-            // Keep EDE text short to avoid inflating UDP responses.
+            // Keep EDE text short to avoid inflating UDP responses. The DNS question already carries the blocked domain.
             EDnsOption[] options = null;
             if (_config.AddExtendedDnsError && request.EDNS is not null)
             {
-                string edeReport = TruncateUtf8(blockingReport, 128);
+                string edeReport = TruncateUtf8(BuildBlockingReport(null, reportedEventId, eventContext), 128);
                 options = new EDnsOption[] { new EDnsOption(EDnsOptionCode.EXTENDED_DNS_ERROR, new EDnsExtendedDnsErrorOptionData(EDnsExtendedDnsErrorCode.Blocked, edeReport)) };
             }
 
@@ -207,7 +206,7 @@ namespace MispConnector
             DnsResponseCode rCode;
             if (_config.AllowTxtBlockingReport && question.Type == DnsResourceRecordType.TXT)
             {
-                string txtReport = TruncateUtf8(blockingReport, 512);
+                string txtReport = TruncateUtf8(BuildBlockingReport(blockedDomain, reportedEventId, eventContext), 512);
                 answer = new DnsResourceRecord[] { new DnsResourceRecord(question.Name, DnsResourceRecordType.TXT, question.Class, _config.BlockingAnswerTtl, new DnsTXTRecordData(txtReport)) };
                 rCode = DnsResponseCode.NoError;
             }
@@ -537,7 +536,7 @@ namespace MispConnector
         private static string BuildBlockingReport(string domain, uint eventId, string eventContext)
         {
             StringBuilder report = new StringBuilder(256);
-            report.Append("source=misp-connector");
+            report.Append("source=misp");
 
             if (eventId != 0)
             {
@@ -545,8 +544,11 @@ namespace MispConnector
                 report.Append(eventId.ToString(CultureInfo.InvariantCulture));
             }
 
-            report.Append(";domain=");
-            report.Append(domain);
+            if (!string.IsNullOrEmpty(domain))
+            {
+                report.Append(";domain=");
+                report.Append(domain);
+            }
 
             if (!string.IsNullOrEmpty(eventContext))
                 report.Append(eventContext);

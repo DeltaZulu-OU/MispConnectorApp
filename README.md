@@ -89,21 +89,21 @@ Supply a JSON configuration like the following:
 * `blockingAnswerTtl` sets the TTL, in seconds, for blocking TXT answers and SOA records. The allowed range is `30` to `86400`; the default is `30`.
 * `allowTxtBlockingReport` returns a TXT blocking report for blocked TXT queries instead of `NXDOMAIN`.
 * `paginationLimit` controls how many attributes are requested from MISP per page. The default is `1000` and the accepted range is `1` to `10000`. MISP may lower this value for the API user's role. Smaller pages reduce transient memory use during refresh at the cost of more API requests.
-* `reportContext` controls how much MISP information is exposed in blocking reports: `none` reports only the source and matched domain, `event-id` also reports the MISP event ID and is the default, and `full` opts in to additional event metadata.
+* `reportContext` controls how much MISP metadata is added to blocking reports: `none` adds no event context, `event-id` adds the MISP event ID and is the default, and `full` opts in to additional event metadata.
 * `addExtendedDnsError` adds a short blocking report to the EDNS payload when the query includes EDNS.
 
 ## Blocking responses
 
-With the default `reportContext: "event-id"`, a report looks like:
+With the default `reportContext: "event-id"`, a TXT report looks like:
 
 ```text
-source=misp-connector;event=3812;domain=evil.example
+source=misp;event=3812;domain=evil.example
 ```
 
 With `reportContext: "full"`, an eligible event can additionally produce:
 
 ```text
-source=misp-connector;event=3812;domain=evil.example;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
+source=misp;event=3812;domain=evil.example;org=CIRCL;threat=high;info=Malicious infrastructure;tags=tlp:clear,confidence:90
 ```
 
 Full event metadata is emitted only when `Event.distribution` is `3` (`All communities`) and the event has no restricted TLP marking. TLP tags other than `TLP:CLEAR` or the legacy `TLP:WHITE` suppress full context; this includes `TLP:GREEN`, `TLP:AMBER`, `TLP:AMBER+STRICT`, and `TLP:RED`. The MISP event ID can still be reported in the default `event-id` mode.
@@ -112,7 +112,7 @@ Possible full-context fields are:
 
 | Field | Meaning |
 | --- | --- |
-| `source` | Always `misp-connector`. |
+| `source` | Always `misp`. |
 | `event` | MISP event ID. |
 | `domain` | The MISP domain attribute that matched the query or one of its parent domains. |
 | `org` | Source organisation (`Event.Orgc.name`). |
@@ -124,7 +124,7 @@ Report values replace field delimiters and control characters before output. Tex
 
 For ordinary queries, the app returns `NXDOMAIN` with an SOA record in the authority section. If `allowTxtBlockingReport` is enabled and the blocked query type is `TXT`, it returns a report of at most 512 UTF-8 bytes as the TXT answer.
 
-If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The event ID is placed before the domain so it remains available when a long domain causes the tail of the EDE text to be truncated. The shorter EDE form limits UDP response inflation; the TXT response is the appropriate place for longer diagnostics.
+If `addExtendedDnsError` is enabled and the request contains EDNS, an independently bounded report of at most 128 UTF-8 bytes is added as an Extended DNS Error with the `Blocked` code. The EDE text omits the domain because the DNS question already identifies it; with the default mode it is typically `source=misp;event=3812`. The shorter EDE form limits UDP response inflation; the TXT response is the appropriate place for longer diagnostics.
 
 ## Duplicate indicators
 

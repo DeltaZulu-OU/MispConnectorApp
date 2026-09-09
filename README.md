@@ -1,5 +1,10 @@
 # MISP Connector for Technitium DNS Server
 
+[![Manual Release](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/release.yml/badge.svg)](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/release.yml)
+[![CodeQL](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/github-code-scanning/codeql)
+[![Dependabot Updates](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/dependabot/dependabot-updates)
+[![SonarQube](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/build.yml/badge.svg)](https://github.com/DeltaZulu-OU/MispConnectorApp/actions/workflows/build.yml)
+
 A plugin that pulls malicious domain indicators from a MISP instance and enforces blocking in [Technitium DNS Server](https://github.com/TechnitiumSoftware/DnsServer).
 
 It maintains an in-memory blocklist for fast lookups, keeps a disk-backed cache for faster startup, and periodically refreshes indicators from the configured instance.
